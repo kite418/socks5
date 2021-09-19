@@ -231,7 +231,12 @@ void socks_entry(int client_socket) {
 
     //should be ready to recv dst_addr
     recv_request(client_socket, s_cmd, dst_addr_len);
-    printf("Destination address: %s:%i", s_cmd->DST_ADDR, s_cmd->DST_PORT);
+    printf("Destination address: %s:%i\n", s_cmd->DST_ADDR, s_cmd->DST_PORT);
+    for (int i = 0; i < 4; ++i) {
+        printf("%hhu ", s_cmd->DST_ADDR[i]);
+    }
+
+    printf("\n");
     
     
     return;
