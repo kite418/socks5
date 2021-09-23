@@ -4,10 +4,12 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
 
 #define BAD_METHOD 0X09
 #define NO_ACCEPTABLE_METHODS 0xFF
 #define SOCKS_VERSION 5
+#define SOCKS_RESERVED 0x00
 
 enum supported_methods {
     NO_AUTH_REQUIRED = 0x00,
@@ -16,6 +18,27 @@ enum supported_methods {
 enum supported_aypt {
     IP_V4 = 0x01,
     DOMAIN = 0x03
+};
+
+enum addr_len { 
+    IPV4_LEN = 0x04,
+};
+
+enum supported_cmd {
+    CMD_CONNECT = 0x01,
+};
+
+enum socks_reply {
+    SUCCEEDED = 0x00,
+    GEN_FAIL = 0X01,
+    CONN_DENIED_RULESET = 0X02,
+    NETWORK_UNREACHABLE = 0X03,
+    HOST_UNREACHABLE = 0X04,
+    CONN_REFUSED = 0X05,
+    TTL_EXPIRED = 0X06,
+    COMMAND_NOT_SUPPORTED = 0X07,
+    ADDR_NOT_SUPPORTED = 0X08,
+    UNASSIGNED = 0X09
 };
 
 typedef struct initial_request {
@@ -29,8 +52,18 @@ typedef struct socks_command {
     int RSV;
     int ATYP;
     char * DST_ADDR;
-    int DST_PORT;
+    unsigned short int DST_PORT;
 } SocksCommand;
+
+typedef struct socks_reply {
+    char version;
+    char reply;
+    char ATYP;
+    char BND_ADDR;
+    unsigned short int BND_PORT;
+    int BND_ADDR_LEN;
+} SocksReply;
+
 
 InitialRequest * inital_request() {
     InitialRequest * new_inital_req = malloc(sizeof(struct initial_request));
@@ -48,6 +81,11 @@ void inital_request_free(InitialRequest * ir) {
 SocksCommand * socks_command() {
     SocksCommand * new_socks_cmd = malloc(sizeof(struct socks_command));
     return new_socks_cmd;
+}
+
+SocksReply * socks_reply() {
+    SocksReply * new_reply = malloc(sizeof(struct socks_reply));
+    return new_reply;
 }
 
 void socks_command_free(SocksCommand * sc) {
@@ -141,6 +179,7 @@ void recv_cmd(int client_socket, SocksCommand * s_cmd) {
 
     s_cmd->version = data[0];
     s_cmd->cmd = data[1];
+    printf("CMD: %d\n", s_cmd->cmd);
     s_cmd->RSV = data[2];
     s_cmd->ATYP = data[3];
 }
@@ -149,15 +188,14 @@ void recv_request(int client_socket, SocksCommand * s_cmd, int dst_addr_len) {
     char * dst_addr = malloc(dst_addr_len + 1);
     recv_safe(client_socket, dst_addr, dst_addr_len);
     dst_addr[dst_addr_len] = '\0';
-    printf("%s\n", dst_addr);
 
-    char dst_port[3] = {'\0', '\0', '\0'};
-    recv_safe(client_socket, dst_port, 2);
-    int port = atoi(dst_port);
+    //2 octets
+    unsigned short int dst_port;
+    recv_safe(client_socket, (char *) &dst_port, 2);
 
     s_cmd->DST_ADDR = dst_addr;
-    s_cmd->DST_PORT = port;
-}
+    s_cmd->DST_PORT = dst_port;
+}   
 
 void print_methods(int methods[], int n_methods) {
     for (int i = 0; i < n_methods; ++i) {
@@ -175,6 +213,82 @@ void send_method_selection(int client_socket, int version, int method) {
 
 int is_valid_version(int version) {
     return (version == 0x05);
+}
+
+int ip4_remote(int client_socket, SocksCommand * sc) {
+    int forwarding_sock = socket(AF_INET, SOCK_STREAM, 0);
+
+    char ipv4_addr[16];
+    sprintf(ipv4_addr, "%hhu.%hhu.%hhu.%hhu", 
+    sc->DST_ADDR[0], sc->DST_ADDR[1], sc->DST_ADDR[2], sc->DST_ADDR[3]
+    );
+
+    struct sockaddr_in server_address;
+    server_address.sin_family = AF_INET;
+    server_address.sin_port = sc->DST_PORT;
+    server_address.sin_addr.s_addr = ipv4_addr;
+
+    int status = connect(forwarding_sock, (struct sockaddr *) &server_address, sizeof(server_address));
+
+    int ret = (status == -1) ? -1 : forwarding_sock;
+    return ret;
+}
+
+void socks_send_reply(int client_socket, SocksReply * s_reply) {
+    char reply_4[4] = {s_reply->version, s_reply->reply, SOCKS_RESERVED, s_reply->ATYP};
+    send_safe(client_socket, reply_4, 4);
+    send_safe(client_socket, s_reply->BND_ADDR, s_reply->BND_ADDR_LEN);
+    send_safe(client_socket, s_reply->BND_PORT, 2);
+}
+
+void socks_ipv4(int client_socket, SocksCommand * s_cmd) {
+    printf("Destination address length: %i\n", IPV4_LEN);
+
+    //recv ipv4 destination addr
+    recv_request(client_socket, s_cmd, IPV4_LEN);
+    printf("Destination address: %hhu.%hhu.%hhu.%hhu:%u\n",  
+    s_cmd->DST_ADDR[0],  s_cmd->DST_ADDR[1],  s_cmd->DST_ADDR[2],  
+    s_cmd->DST_ADDR[3], ntohs(s_cmd->DST_PORT)
+    );
+
+    char reply;
+    switch (s_cmd->cmd) {
+    case CMD_CONNECT:
+        int remote_fd = ip4_remote(client_socket, s_cmd);
+        if (remote_fd == -1) {
+            switch (errno) {
+            case ENETUNREACH:
+                reply = NETWORK_UNREACHABLE;
+                break;
+            case ECONNREFUSED:
+                reply = CONN_REFUSED;
+            default:
+                reply = GEN_FAIL;
+                break;
+            }
+        } else {
+            reply = SUCCEEDED;
+        }
+
+        break;
+    
+    default:
+        reply = COMMAND_NOT_SUPPORTED
+        break;
+    }
+
+    SocksReply * s_reply = socks_reply();
+    s_reply->ATYP = s_cmd->ATYP;
+    s_reply->BND_ADDR = s_cmd->DST_ADDR;
+    s_reply->BND_ADDR_LEN = IPV4_LEN;
+    s_reply->BND_PORT= s_cmd->DST_PORT;
+    s_reply->reply = reply;
+    s_reply->version = s_cmd->version;
+
+    socks_send_reply(client_socket, s_reply);
+
+    
+
 }
 
 void socks_entry(int client_socket) {
@@ -218,27 +332,19 @@ void socks_entry(int client_socket) {
     SocksCommand * s_cmd = malloc(sizeof(struct socks_command));
     recv_cmd(client_socket, s_cmd);
     printf("ATYP: %i\n", s_cmd->ATYP);
-    int dst_addr_len = handle_atyp(s_cmd->ATYP);
-    
-    if (dst_addr_len < 0) {
-        printf("Invalid ATYP");
+
+    switch (s_cmd->ATYP) {
+    case IP_V4:
+        printf("Request is IPV4\n");
+        socks_ipv4(client_socket, s_cmd);
+        break;
+    default:
+        printf("ADDRESS NOT SUPPORTED\n");
         free(s_cmd);
         s_cmd = NULL;
-        return;
+        exit(0);
     }
 
-    printf("Destination address length: %i\n", dst_addr_len);
-
-    //should be ready to recv dst_addr
-    recv_request(client_socket, s_cmd, dst_addr_len);
-    printf("Destination address: %s:%i\n", s_cmd->DST_ADDR, s_cmd->DST_PORT);
-    for (int i = 0; i < 4; ++i) {
-        printf("%hhu ", s_cmd->DST_ADDR[i]);
-    }
-
-    printf("\n");
-    
-    
     return;
 }
 
